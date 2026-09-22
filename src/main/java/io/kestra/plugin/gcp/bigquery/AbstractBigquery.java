@@ -221,6 +221,12 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
 
                             if (previousJob != null) {
                                 if (!previousJob.isDone()) {
+                                    // DELIBERATELY still Job.waitFor() here, unlike the main wait below.
+                                    // This is the re-attach path hardened by #688 to stop a resubmit
+                                    // running the same statement twice; its tests assert exact request
+                                    // counts against the /queries/{jobId} endpoint. The hang this class
+                                    // fixes occurs in the MAIN wait, so narrowing the change to that one
+                                    // call keeps duplicate-submission safety exactly as tested.
                                     previousJob = previousJob.waitFor();
                                 }
 
@@ -251,7 +257,7 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
                     logger.debug("Starting job '{}'", job.getJobId());
 
                     if (!dryRun) {
-                        job = job.waitFor();
+                        job = pollUntilDone(connection, job);
                     }
 
                     BigQueryService.handleErrors(job, logger);
@@ -292,6 +298,67 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
                     throw new BigQueryException(errors, exception, retryable);
                 }
             });
+    }
+
+    /** Poll backoff: short first so a fast job is not held behind a floor, then widened. */
+    private static final Duration JOB_POLL_INITIAL_INTERVAL = Duration.ofMillis(500);
+
+    private static final Duration JOB_POLL_MAX_INTERVAL = Duration.ofSeconds(5);
+
+    /** Ceiling on the whole wait, matching the client's own DEFAULT_JOB_WAIT_SETTINGS totalTimeout. */
+    private static final Duration JOB_WAIT_TIMEOUT = Duration.ofHours(12);
+
+    /**
+     * Await completion by polling jobs.get rather than Job#waitFor().
+     *
+     * waitFor() delegates to waitForQueryResults(), whose retry config treats rateLimitExceeded as
+     * retryable. It cannot tell a throttled API call from a job that has already FAILED with a quota
+     * error, so it retries a terminal state for up to DEFAULT_JOB_WAIT_SETTINGS' 12h totalTimeout.
+     * jobs.get returns the terminal job as data, so handleErrors() reports it and retryReasons -- which
+     * lists rateLimitExceeded first -- applies as documented.
+     *
+     * Returns null when the job no longer exists, matching Job#waitFor()'s contract.
+     */
+    private static Job pollUntilDone(BigQuery connection, Job job) throws InterruptedException {
+        var deadline = System.nanoTime() + JOB_WAIT_TIMEOUT.toNanos();
+        var interval = JOB_POLL_INITIAL_INTERVAL;
+
+        while (job != null && !job.isDone()) {
+            if (System.nanoTime() - deadline >= 0) {
+                throw new IllegalStateException(
+                    "Timed out after " + JOB_WAIT_TIMEOUT + " waiting for job '" + job.getJobId() + "' to complete"
+                );
+            }
+
+            Thread.sleep(interval.toMillis());
+
+            interval = interval.multipliedBy(2);
+            if (interval.compareTo(JOB_POLL_MAX_INTERVAL) > 0) {
+                interval = JOB_POLL_MAX_INTERVAL;
+            }
+
+            // A null read is TRANSIENT, not "the job is gone". jobs.get can briefly fail to
+            // see a job that was just submitted (eventual consistency), and returning null
+            // here would reach handleErrors(null), which throws IllegalArgumentException --
+            // NOT a retryable reason, so a momentary blip would become a hard task failure.
+            // Job.waitFor() absorbs this internally; keep polling and let the deadline above
+            // be the only way out.
+            var refreshed = connection.getJob(job.getJobId());
+            if (refreshed != null) {
+                job = refreshed;
+            }
+        }
+
+        // Job#isDone() reloads internally but leaves this handle stale, so a job that failed
+        // after starting would otherwise be reported as a success. Re-read before reporting.
+        if (job != null) {
+            var refreshed = connection.getJob(job.getJobId());
+            if (refreshed != null) {
+                job = refreshed;
+            }
+        }
+
+        return job;
     }
 
     /** The client wraps an interrupt in a BigQueryException carrying no error list, so match on the cause chain. */

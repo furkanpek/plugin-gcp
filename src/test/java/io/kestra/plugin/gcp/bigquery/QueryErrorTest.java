@@ -345,10 +345,10 @@ public class QueryErrorTest {
 
         assertThrows(Exception.class, () -> task.run(runContext));
 
-        // job.waitFor() polls the same results endpoint and fails once before AbstractBigquery#waitForJob
-        // finds the already-completed job via getJob() and short-circuits without submitting a duplicate job;
-        // the 3 remaining hits come from the dedicated "fetch results" retry loop in Query#run.
-        verify(4, getRequestedFor(urlPathMatching(resultsPath)));
+        // Completion is awaited by polling jobs/{jobId}, so the wait no longer spends a call on the
+        // results endpoint: all 3 hits here come from the dedicated "fetch results" retry loop in
+        // Query#run, which is what this test is about.
+        verify(3, getRequestedFor(urlPathMatching(resultsPath)));
         verify(1, postRequestedFor(urlPathMatching(jobsPath)));
     }
 
@@ -444,14 +444,44 @@ public class QueryErrorTest {
                 )
         );
 
-        // The job's real status, fetched directly, shows it is still running.
+        // Completion is awaited by polling jobs/{jobId}, so that endpoint carries the sequence this
+        // test is about: the first poll fails transiently, the retry's direct lookup then finds the
+        // job STILL RUNNING (so it must re-attach rather than resubmit), and it completes after that.
         stubFor(
             get(urlPathMatching(jobStatusPath))
+                .inScenario("still-running-status")
+                .whenScenarioStateIs(Scenario.STARTED)
+                .willReturn(
+                    aResponse()
+                        .withStatus(503)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody(BACKEND_ERROR_RESPONSE)
+                )
+                .willSetStateTo("looked-up")
+        );
+
+        stubFor(
+            get(urlPathMatching(jobStatusPath))
+                .inScenario("still-running-status")
+                .whenScenarioStateIs("looked-up")
                 .willReturn(
                     aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody(JOB_RESPONSE_RUNNING)
+                )
+                .willSetStateTo("completed")
+        );
+
+        stubFor(
+            get(urlPathMatching(jobStatusPath))
+                .inScenario("still-running-status")
+                .whenScenarioStateIs("completed")
+                .willReturn(
+                    aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody(JOB_RESPONSE_DUP_TEST_DONE)
                 )
         );
 
@@ -512,13 +542,40 @@ public class QueryErrorTest {
                 )
         );
 
-        // The job's real status, fetched directly, shows it actually failed: no dedup, a new job is submitted.
-        // Job#waitFor() itself calls reload() (another GET on this same path) once the fresh job completes,
-        // to fetch its authoritative final status, so the stub must distinguish that call from the lookback.
+        // Completion is awaited by polling jobs/{jobId}, so this endpoint now carries the whole
+        // sequence: the first poll fails transiently, the retry's lookback then finds the original
+        // job DONE WITH AN ERROR (read twice -- once by getJob, once by isDone), so it is not
+        // deduplicated and a fresh job is submitted, which polls clean.
         stubFor(
             get(urlPathMatching(jobStatusPath))
                 .inScenario("done-with-error-status")
                 .whenScenarioStateIs(Scenario.STARTED)
+                .willReturn(
+                    aResponse()
+                        .withStatus(503)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody(BACKEND_ERROR_RESPONSE)
+                )
+                .willSetStateTo("looked-up")
+        );
+
+        stubFor(
+            get(urlPathMatching(jobStatusPath))
+                .inScenario("done-with-error-status")
+                .whenScenarioStateIs("looked-up")
+                .willReturn(
+                    aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody(JOB_RESPONSE_DUP_TEST_DONE_WITH_ERROR)
+                )
+                .willSetStateTo("error-confirmed")
+        );
+
+        stubFor(
+            get(urlPathMatching(jobStatusPath))
+                .inScenario("done-with-error-status")
+                .whenScenarioStateIs("error-confirmed")
                 .willReturn(
                     aResponse()
                         .withStatus(200)
@@ -592,13 +649,26 @@ public class QueryErrorTest {
                 )
         );
 
-        // The job can no longer be found: no dedup, a new job is submitted.
-        // Job#waitFor() itself calls reload() (another GET on this same path) once the fresh job completes,
-        // to fetch its authoritative final status, so the stub must distinguish that call from the lookback.
+        // Completion is awaited by polling jobs/{jobId}, so this endpoint carries the sequence: the
+        // first poll fails transiently, the retry's lookback then cannot find the job at all, so there
+        // is nothing to deduplicate against and a fresh job is submitted, which polls clean.
         stubFor(
             get(urlPathMatching(jobStatusPath))
                 .inScenario("not-found-status")
                 .whenScenarioStateIs(Scenario.STARTED)
+                .willReturn(
+                    aResponse()
+                        .withStatus(503)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody(BACKEND_ERROR_RESPONSE)
+                )
+                .willSetStateTo("looked-up")
+        );
+
+        stubFor(
+            get(urlPathMatching(jobStatusPath))
+                .inScenario("not-found-status")
+                .whenScenarioStateIs("looked-up")
                 .willReturn(
                     aResponse()
                         .withStatus(404)
