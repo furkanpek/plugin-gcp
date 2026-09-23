@@ -44,6 +44,13 @@ class BigQueryTransientErrorTest {
     @Inject
     private RunContextFactory runContextFactory;
 
+    private static JobStatus runningStatus() {
+        var status = Mockito.mock(JobStatus.class);
+        Mockito.when(status.getState()).thenReturn(JobStatus.State.RUNNING);
+
+        return status;
+    }
+
     @AfterEach
     void clearInterruptFlag() {
         // waitForJob restores the interrupt flag, and JUnit reuses this thread.
@@ -87,9 +94,10 @@ class BigQueryTransientErrorTest {
 
         var unavailable = new com.google.cloud.bigquery.BigQueryException(503, "The service is currently unavailable.");
         var job = runningJob("job_poll_failed");
-        Mockito.when(job.waitFor()).thenThrow(unavailable);
+        var connection = Mockito.mock(BigQuery.class);
+        Mockito.when(connection.getJob(job.getJobId())).thenThrow(unavailable);
 
-        var failure = failureOf(task, runContext, () -> job);
+        var failure = failureOf(task, runContext, () -> job, connection);
 
         assertThat(failure.isRetryable(), is(true));
         assertThat(failure.getCause(), instanceOf(com.google.cloud.bigquery.BigQueryException.class));
@@ -103,10 +111,11 @@ class BigQueryTransientErrorTest {
 
         // A socket timeout has no HTTP status at all, yet the client reports it as worth retrying.
         var job = runningJob("job_socket_timeout");
-        Mockito.when(job.waitFor())
+        var connection = Mockito.mock(BigQuery.class);
+        Mockito.when(connection.getJob(job.getJobId()))
             .thenThrow(new com.google.cloud.bigquery.BigQueryException(new SocketTimeoutException("read timed out")));
 
-        var failure = failureOf(task, runContext, () -> job);
+        var failure = failureOf(task, runContext, () -> job, connection);
 
         assertThat(failure.isRetryable(), is(true));
         assertThat(failure.getMessage(), containsString("read timed out"));
@@ -139,15 +148,21 @@ class BigQueryTransientErrorTest {
         var runContext = TestsUtils.mockRunContext(runContextFactory, task, ImmutableMap.of());
         var submissions = new AtomicInteger();
 
-        // Job#waitFor declares InterruptedException raw, on top of the wrapped shape the client also uses.
+        // The poll sleeps between attempts, so an interrupt lands as a raw InterruptedException
+        // out of Thread.sleep -- the same shape Job#waitFor used to declare.
         var job = runningJob("job_interrupted");
-        Mockito.when(job.waitFor()).thenThrow(new InterruptedException());
+        var connection = Mockito.mock(BigQuery.class);
+        Mockito.when(connection.getJob(job.getJobId())).thenAnswer(invocation ->
+        {
+            Thread.currentThread().interrupt();
+            throw new InterruptedException();
+        });
 
         var failure = failureOf(task, runContext, () ->
         {
             submissions.incrementAndGet();
             return job;
-        });
+        }, connection);
 
         assertThat(failure.isRetryable(), is(false));
         assertThat(failure.getErrors(), hasSize(1));
@@ -176,13 +191,179 @@ class BigQueryTransientErrorTest {
         assertThat(failure.getErrors().getFirst().getMessage(), not(containsString("may still be running")));
     }
 
+    /**
+     * A quota error on a job that has ALREADY FINISHED must be reported, not retried.
+     *
+     * Job#waitFor() delegates to waitForQueryResults(), whose BigQueryRetryHelper config treats
+     * `rateLimitExceeded` as retryable. That is right when the API call was throttled, but when
+     * the JOB ITSELF died of a quota error the same message keeps coming back, so the client
+     * retried a terminal state under a 12-hour totalTimeout and the task never finished.
+     *
+     * Note this is also the FIRST entry in the task's own `retryReasons` default: the plugin
+     * already intends to handle rateLimitExceeded via its own retry policy, and could not,
+     * because the client swallowed it first.
+     */
+    @Test
+    void shouldReportATerminalQuotaErrorInsteadOfRetryingIt() throws Exception {
+        var task = task();
+        var runContext = TestsUtils.mockRunContext(runContextFactory, task, ImmutableMap.of());
+
+        var jobId = JobId.of("project", "job_rate_limited");
+
+        // Submitted clean, so the pre-wait error check passes and the wait is actually entered.
+        // Built before the when(...) chain: creating a mock inside thenReturn() trips
+        // Mockito's UnfinishedStubbingException.
+        var submittedStatus = runningStatus();
+
+        var submitted = Mockito.mock(Job.class);
+        Mockito.when(submitted.getJobId()).thenReturn(jobId);
+        Mockito.when(submitted.getStatus()).thenReturn(submittedStatus);
+
+        // It then finishes having hit the quota.
+        var quota = terminalJob(
+            "job_rate_limited",
+            new BigQueryError(
+                "rateLimitExceeded", null,
+                "Exceeded rate limits: too many table dml insert operations for this table."
+            )
+        );
+
+        var connection = Mockito.mock(BigQuery.class);
+        Mockito.when(connection.getJob(jobId)).thenReturn(quota);
+
+        var failure = failureOf(task, runContext, () -> submitted, connection);
+
+        assertThat(failure.getErrors(), hasSize(1));
+        assertThat(failure.getErrors().getFirst().getReason(), is("rateLimitExceeded"));
+        assertThat(failure.getMessage(), containsString("too many table dml insert operations"));
+    }
+
+    /**
+     * A submission-time rejection leaves a bare job reference whose getStatus() is null, because
+     * Job#isDone() reloads internally and reports terminal without populating the handle we hold.
+     * Without a re-fetch, handleErrors() throws "has no status to report" -- an IllegalStateException
+     * that is not retryable -- so the real BigQuery reason is lost and the task fails uninformatively.
+     */
+    @Test
+    void shouldRefetchAJobThatIsTerminalWithNoStatus() throws Exception {
+        var task = task();
+        var runContext = TestsUtils.mockRunContext(runContextFactory, task, ImmutableMap.of());
+
+        var outstanding = new BigQueryError(
+            "resourcesExceeded", null,
+            "Resources exceeded during query execution: Too many DML statements outstanding against table."
+        );
+        var jobId = JobId.of("project", "job_no_status");
+
+        // What createJob() hands back on a rejected submission: terminal, but status not populated.
+        var bare = Mockito.mock(Job.class);
+        Mockito.when(bare.getJobId()).thenReturn(jobId);
+        Mockito.when(bare.getStatus()).thenReturn(null);
+
+        // Built BEFORE the when(...) chain: creating a mock inside thenReturn() trips
+        // Mockito's UnfinishedStubbingException.
+        var refetched = terminalJob("job_no_status", outstanding);
+
+        var connection = Mockito.mock(BigQuery.class);
+        Mockito.when(connection.getJob(jobId)).thenReturn(refetched);
+
+        var failure = failureOf(task, runContext, () -> bare, connection);
+
+        assertThat(failure.getErrors(), hasSize(1));
+        assertThat(failure.getErrors().getFirst().getReason(), is("resourcesExceeded"));
+        assertThat(failure.getMessage(), containsString("Too many DML statements outstanding"));
+    }
+
+    /**
+     * A job submitted as RUNNING that later FAILS must never be reported as a success.
+     *
+     * Job#isDone() reloads internally but does not refresh the handle the caller holds, so after
+     * the wait that handle can still carry the RUNNING status it was created with. Reporting from
+     * it would find no error and pass -- a silent false success on a job BigQuery actually failed.
+     */
+    @Test
+    void shouldNotReportSuccessWhenTheHeldHandleStillSaysRunning() throws Exception {
+        var task = task();
+        var runContext = TestsUtils.mockRunContext(runContextFactory, task, ImmutableMap.of());
+
+        var jobId = JobId.of("project", "job_stale_handle");
+
+        // The handle from createJob(): reports terminal, but its cached status shows no error.
+        var runningStatus = runningStatus();
+
+        var stale = Mockito.mock(Job.class);
+        Mockito.when(stale.getJobId()).thenReturn(jobId);
+        Mockito.when(stale.getStatus()).thenReturn(runningStatus);
+
+        // The authoritative job says it failed.
+        var authoritative = terminalJob("job_stale_handle", new BigQueryError("invalidQuery", null, "Division by zero"));
+
+        var connection = Mockito.mock(BigQuery.class);
+        Mockito.when(connection.getJob(jobId)).thenReturn(authoritative);
+
+        var failure = failureOf(task, runContext, () -> stale, connection);
+
+        assertThat(failure.getErrors(), hasSize(1));
+        assertThat(failure.getErrors().getFirst().getReason(), is("invalidQuery"));
+        assertThat(failure.getMessage(), containsString("Division by zero"));
+    }
+
+    /**
+     * jobs.get can briefly fail to see a job that was just submitted. Treating that null as
+     * "the job is gone" reaches handleErrors(null), which throws IllegalArgumentException --
+     * not a retryable reason -- turning a momentary blip into a hard task failure.
+     */
+    @Test
+    void shouldKeepPollingWhenGetJobTransientlyReturnsNull() throws Exception {
+        var task = task();
+        var runContext = TestsUtils.mockRunContext(runContextFactory, task, ImmutableMap.of());
+
+        var jobId = JobId.of("project", "job_transient_null");
+        var polled = new AtomicInteger();
+
+        var pollingStatus = runningStatus();
+
+        var job = Mockito.mock(Job.class);
+        Mockito.when(job.getJobId()).thenReturn(jobId);
+        Mockito.when(job.getStatus()).thenReturn(pollingStatus);
+
+        var failed = terminalJob("job_transient_null", new BigQueryError("invalidQuery", null, "Syntax error"));
+
+        var connection = Mockito.mock(BigQuery.class);
+        Mockito.when(connection.getJob(jobId)).thenAnswer(invocation ->
+            polled.incrementAndGet() == 1 ? null : failed
+        );
+
+        var failure = failureOf(task, runContext, () -> job, connection);
+
+        // The null was absorbed: polling continued and the real error still surfaced.
+        // Two reads: the absorbed null, then the terminal job.
+        assertThat(polled.get(), is(2));
+        assertThat(failure.getErrors().getFirst().getReason(), is("invalidQuery"));
+        assertThat(failure.getCause(), not(instanceOf(IllegalArgumentException.class)));
+    }
+
     private BigQueryException failureOf(Query task, io.kestra.core.runners.RunContext runContext, java.util.concurrent.Callable<Job> createJob) {
+        return failureOf(task, runContext, createJob, Mockito.mock(BigQuery.class));
+    }
+
+    /**
+     * Completion is awaited by POLLING jobs.get, so a transient poll failure has to be injected
+     * on the connection rather than on Job#waitFor(). Tests that exercise the poll therefore
+     * need to hand in the connection they stubbed.
+     */
+    private BigQueryException failureOf(
+        Query task,
+        io.kestra.core.runners.RunContext runContext,
+        java.util.concurrent.Callable<Job> createJob,
+        BigQuery connection
+    ) {
         var thrown = assertThrows(
             FailsafeException.class, () -> task.waitForJob(
                 runContext.logger(),
                 createJob,
                 runContext,
-                Mockito.mock(BigQuery.class)
+                connection
             )
         );
 
@@ -192,10 +373,30 @@ class BigQueryTransientErrorTest {
     private Job runningJob(String id) {
         var status = Mockito.mock(JobStatus.class);
         Mockito.when(status.getError()).thenReturn(null);
+        Mockito.when(status.getState()).thenReturn(JobStatus.State.RUNNING);
 
         var job = Mockito.mock(Job.class);
         Mockito.when(job.getJobId()).thenReturn(JobId.of("project", id));
         Mockito.when(job.getStatus()).thenReturn(status);
+
+        return job;
+    }
+
+    /** A job already in a terminal state, carrying {@code error} (null for a clean success). */
+    private Job terminalJob(String id, BigQueryError error) {
+        var status = Mockito.mock(JobStatus.class);
+        Mockito.when(status.getError()).thenReturn(error);
+        // Left null deliberately: handleErrors() collects getError() AND getExecutionErrors(),
+        // so echoing the same error in both would report it twice.
+        Mockito.when(status.getExecutionErrors()).thenReturn(null);
+        Mockito.when(status.getState()).thenReturn(JobStatus.State.DONE);
+
+        var job = Mockito.mock(Job.class);
+        Mockito.when(job.getJobId()).thenReturn(JobId.of("project", id));
+        Mockito.when(job.getStatus()).thenReturn(status);
+        // The lookback path still calls Job#isDone() directly, so a terminal job must report
+        // terminal to every caller, not only to the status-based poll.
+        Mockito.when(job.isDone()).thenReturn(true);
 
         return job;
     }
@@ -205,6 +406,9 @@ class BigQueryTransientErrorTest {
             .id(BigQueryTransientErrorTest.class.getSimpleName())
             .type(Query.class.getName())
             .sql(Property.ofValue("SELECT 1"))
+            // Per-instance so the poll loop does not sleep on real wall clock; no shared state.
+            .jobPollInitialInterval(Duration.ofMillis(1))
+            .jobPollMaxInterval(Duration.ofMillis(2))
             .retryAuto(
                 Exponential.builder()
                     .type("exponential")
