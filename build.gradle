@@ -9,7 +9,6 @@ plugins {
     id 'jacoco'
     id "com.gradleup.shadow" version "9.6.1"
     id 'signing'
-    id "com.github.ben-manes.versions" version "0.60.0"
     id 'net.researchgate.release' version '3.1.0'
     id 'com.github.node-gradle.node' version '7.1.0'
 }
@@ -17,7 +16,6 @@ plugins {
 def isBuildSnapshot = version.toString().endsWith("-SNAPSHOT")
 
 repositories {
-    mavenLocal()
     google()
     mavenCentral()
     if (isBuildSnapshot) {
@@ -74,6 +72,9 @@ dependencies {
 
     // libs
     compileOnly group: 'dev.failsafe', name: 'failsafe'
+
+    // Shared kernel: GcpInterface / CredentialService / AbstractTask
+    api 'io.kestra.plugin:plugin-gcp-lib:1.0.0'
 
     // Google libraries are managed by the the Kestra Platform so they are aligned on all plugins
     api 'com.google.cloud:google-cloud-storage'

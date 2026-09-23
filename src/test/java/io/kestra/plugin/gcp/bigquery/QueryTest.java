@@ -13,6 +13,7 @@ import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -266,17 +267,25 @@ class QueryTest {
     }
 
     @Test
+    // BigQuery's job.waitFor() has no polling cap, so a single stalled WRITE_TRUNCATE job blocks
+    // invokeAll() indefinitely (12h waitFor default) and hung CI for 90m+ until the 6h job cap. This
+    // is a hang detector, not a retry-budget enforcer: a healthy run converges in ~10s, so 5m leaves
+    // ~30x headroom while failing fast on a genuine stall.
+    @Timeout(value = 5, unit = TimeUnit.MINUTES)
     void retry() throws Exception {
         ExecutorService executorService = Executors.newCachedThreadPool();
-        String table = project + "." + dataset + "." + FriendlyId.createFriendlyId();
 
-        // Real BigQuery caps concurrent WRITE_TRUNCATE jobs per table. 10 concurrent jobs stay
-        // comfortably under that quota so the retry-on-quota-error behavior converges reliably
-        // instead of depending on how many of a larger batch happen to collide.
+        // Each task writes to its own destination table. Sharing a single table here used to make
+        // the 10 WRITE_TRUNCATE jobs contend/serialize against each other on the BigQuery side,
+        // which made the wall-clock time depend on BigQuery's own queuing behavior rather than on
+        // this task's retry logic, occasionally starving the hang-detector budget below. Concurrent
+        // jobs on separate tables still exercise retryAuto under real concurrent execution without
+        // that external contention.
         int concurrency = 10;
         List<Callable<Query.Output>> tasks = new ArrayList<>();
 
         for (int i = 0; i < concurrency; i++) {
+            String table = project + "." + dataset + "." + FriendlyId.createFriendlyId();
             Query task = Query.builder()
                 .id(QueryTest.class.getSimpleName())
                 .type(Query.class.getName())
