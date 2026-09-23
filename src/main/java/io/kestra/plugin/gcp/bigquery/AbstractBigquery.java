@@ -301,10 +301,19 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
     }
 
     /** Poll backoff: short first so a fast job is not held behind a floor, then widened. */
-    /** Poll backoff: short first so a fast job is not held behind a floor, then widened. */
-    static Duration jobPollInitialInterval = Duration.ofMillis(500);
+    @JsonIgnore
+    @Getter(AccessLevel.NONE)
+    @EqualsAndHashCode.Exclude
+    @ToString.Exclude
+    @Builder.Default
+    Duration jobPollInitialInterval = Duration.ofMillis(500);
 
-    static Duration jobPollMaxInterval = Duration.ofSeconds(5);
+    @JsonIgnore
+    @Getter(AccessLevel.NONE)
+    @EqualsAndHashCode.Exclude
+    @ToString.Exclude
+    @Builder.Default
+    Duration jobPollMaxInterval = Duration.ofSeconds(5);
 
     /** Ceiling on the whole wait, matching the client's own DEFAULT_JOB_WAIT_SETTINGS totalTimeout. */
     private static final Duration JOB_WAIT_TIMEOUT = Duration.ofHours(12);
@@ -324,9 +333,9 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
      *
      * Returns null when the job no longer exists, matching Job#waitFor()'s contract.
      */
-    private static Job pollUntilDone(BigQuery connection, Job job, Logger logger) throws InterruptedException, BigQueryException {
+    private Job pollUntilDone(BigQuery connection, Job job, Logger logger) throws InterruptedException, BigQueryException {
         var deadline = System.nanoTime() + JOB_WAIT_TIMEOUT.toNanos();
-        var interval = jobPollInitialInterval;
+        var interval = this.jobPollInitialInterval;
 
         while (job != null && !isDone(job)) {
             if (System.nanoTime() - deadline >= 0) {
@@ -336,8 +345,8 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
             Thread.sleep(interval.toMillis());
 
             interval = interval.multipliedBy(2);
-            if (interval.compareTo(jobPollMaxInterval) > 0) {
-                interval = jobPollMaxInterval;
+            if (interval.compareTo(this.jobPollMaxInterval) > 0) {
+                interval = this.jobPollMaxInterval;
             }
 
             // A null read is TRANSIENT, not "the job is gone": jobs.get can briefly fail to see a

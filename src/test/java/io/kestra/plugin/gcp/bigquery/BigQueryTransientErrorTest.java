@@ -7,7 +7,6 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
@@ -44,18 +43,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 class BigQueryTransientErrorTest {
     @Inject
     private RunContextFactory runContextFactory;
-
-    @BeforeEach
-    void shrinkPollInterval() {
-        AbstractBigquery.jobPollInitialInterval = Duration.ofMillis(1);
-        AbstractBigquery.jobPollMaxInterval = Duration.ofMillis(2);
-    }
-
-    @AfterEach
-    void restorePollInterval() {
-        AbstractBigquery.jobPollInitialInterval = Duration.ofMillis(500);
-        AbstractBigquery.jobPollMaxInterval = Duration.ofSeconds(5);
-    }
 
     private static JobStatus runningStatus() {
         var status = Mockito.mock(JobStatus.class);
@@ -419,6 +406,9 @@ class BigQueryTransientErrorTest {
             .id(BigQueryTransientErrorTest.class.getSimpleName())
             .type(Query.class.getName())
             .sql(Property.ofValue("SELECT 1"))
+            // Per-instance so the poll loop does not sleep on real wall clock; no shared state.
+            .jobPollInitialInterval(Duration.ofMillis(1))
+            .jobPollMaxInterval(Duration.ofMillis(2))
             .retryAuto(
                 Exponential.builder()
                     .type("exponential")
