@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
@@ -43,6 +44,25 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 class BigQueryTransientErrorTest {
     @Inject
     private RunContextFactory runContextFactory;
+
+    @BeforeEach
+    void shrinkPollInterval() {
+        AbstractBigquery.jobPollInitialInterval = Duration.ofMillis(1);
+        AbstractBigquery.jobPollMaxInterval = Duration.ofMillis(2);
+    }
+
+    @AfterEach
+    void restorePollInterval() {
+        AbstractBigquery.jobPollInitialInterval = Duration.ofMillis(500);
+        AbstractBigquery.jobPollMaxInterval = Duration.ofSeconds(5);
+    }
+
+    private static JobStatus runningStatus() {
+        var status = Mockito.mock(JobStatus.class);
+        Mockito.when(status.getState()).thenReturn(JobStatus.State.RUNNING);
+
+        return status;
+    }
 
     @AfterEach
     void clearInterruptFlag() {
@@ -204,10 +224,13 @@ class BigQueryTransientErrorTest {
         var jobId = JobId.of("project", "job_rate_limited");
 
         // Submitted clean, so the pre-wait error check passes and the wait is actually entered.
+        // Built before the when(...) chain: creating a mock inside thenReturn() trips
+        // Mockito's UnfinishedStubbingException.
+        var submittedStatus = runningStatus();
+
         var submitted = Mockito.mock(Job.class);
         Mockito.when(submitted.getJobId()).thenReturn(jobId);
-        Mockito.when(submitted.getStatus()).thenReturn(Mockito.mock(JobStatus.class));
-        Mockito.when(submitted.isDone()).thenReturn(false, true);
+        Mockito.when(submitted.getStatus()).thenReturn(submittedStatus);
 
         // It then finishes having hit the quota.
         var quota = terminalJob(
@@ -248,7 +271,6 @@ class BigQueryTransientErrorTest {
         // What createJob() hands back on a rejected submission: terminal, but status not populated.
         var bare = Mockito.mock(Job.class);
         Mockito.when(bare.getJobId()).thenReturn(jobId);
-        Mockito.when(bare.isDone()).thenReturn(true);
         Mockito.when(bare.getStatus()).thenReturn(null);
 
         // Built BEFORE the when(...) chain: creating a mock inside thenReturn() trips
@@ -280,12 +302,10 @@ class BigQueryTransientErrorTest {
         var jobId = JobId.of("project", "job_stale_handle");
 
         // The handle from createJob(): reports terminal, but its cached status shows no error.
-        var runningStatus = Mockito.mock(JobStatus.class);
-        Mockito.when(runningStatus.getError()).thenReturn(null);
+        var runningStatus = runningStatus();
 
         var stale = Mockito.mock(Job.class);
         Mockito.when(stale.getJobId()).thenReturn(jobId);
-        Mockito.when(stale.isDone()).thenReturn(true);
         Mockito.when(stale.getStatus()).thenReturn(runningStatus);
 
         // The authoritative job says it failed.
@@ -314,14 +334,11 @@ class BigQueryTransientErrorTest {
         var jobId = JobId.of("project", "job_transient_null");
         var polled = new AtomicInteger();
 
-        var runningStatus = Mockito.mock(JobStatus.class);
+        var pollingStatus = runningStatus();
 
         var job = Mockito.mock(Job.class);
         Mockito.when(job.getJobId()).thenReturn(jobId);
-        Mockito.when(job.getStatus()).thenReturn(runningStatus);
-        // Still running across BOTH checks: the first poll returns null (absorbed, so this same
-        // handle is re-checked), the second returns the terminal job which reports done itself.
-        Mockito.when(job.isDone()).thenReturn(false, false);
+        Mockito.when(job.getStatus()).thenReturn(pollingStatus);
 
         var failed = terminalJob("job_transient_null", new BigQueryError("invalidQuery", null, "Syntax error"));
 
@@ -333,9 +350,8 @@ class BigQueryTransientErrorTest {
         var failure = failureOf(task, runContext, () -> job, connection);
 
         // The null was absorbed: polling continued and the real error still surfaced.
-        // Three reads: the absorbed null, the terminal job, then the mandatory re-read that
-        // guards against reporting from a stale handle.
-        assertThat(polled.get(), is(3));
+        // Two reads: the absorbed null, then the terminal job.
+        assertThat(polled.get(), is(2));
         assertThat(failure.getErrors().getFirst().getReason(), is("invalidQuery"));
         assertThat(failure.getCause(), not(instanceOf(IllegalArgumentException.class)));
     }
@@ -370,6 +386,7 @@ class BigQueryTransientErrorTest {
     private Job runningJob(String id) {
         var status = Mockito.mock(JobStatus.class);
         Mockito.when(status.getError()).thenReturn(null);
+        Mockito.when(status.getState()).thenReturn(JobStatus.State.RUNNING);
 
         var job = Mockito.mock(Job.class);
         Mockito.when(job.getJobId()).thenReturn(JobId.of("project", id));
@@ -385,10 +402,13 @@ class BigQueryTransientErrorTest {
         // Left null deliberately: handleErrors() collects getError() AND getExecutionErrors(),
         // so echoing the same error in both would report it twice.
         Mockito.when(status.getExecutionErrors()).thenReturn(null);
+        Mockito.when(status.getState()).thenReturn(JobStatus.State.DONE);
 
         var job = Mockito.mock(Job.class);
         Mockito.when(job.getJobId()).thenReturn(JobId.of("project", id));
         Mockito.when(job.getStatus()).thenReturn(status);
+        // The lookback path still calls Job#isDone() directly, so a terminal job must report
+        // terminal to every caller, not only to the status-based poll.
         Mockito.when(job.isDone()).thenReturn(true);
 
         return job;
