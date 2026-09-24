@@ -220,16 +220,12 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
                             var previousJob = connection.getJob(previousJobId);
 
                             if (previousJob != null) {
-                                if (!previousJob.isDone()) {
-                                    // DELIBERATELY still Job.waitFor() here, unlike the main wait below.
-                                    // This is the re-attach path hardened by #688 to stop a resubmit
-                                    // running the same statement twice; its tests assert exact request
-                                    // counts against the /queries/{jobId} endpoint. The hang this class
-                                    // fixes occurs in the MAIN wait, so narrowing the change to that one
-                                    // call keeps duplicate-submission safety exactly as tested.
-                                    previousJob = previousJob.waitFor();
-                                }
+                                previousJob = pollUntilDone(connection, previousJob, logger);
+                            }
 
+                            // waitFor() and the poll both report null when the job no longer exists,
+                            // so there is nothing to deduplicate against and the resubmit below applies.
+                            if (previousJob != null) {
                                 if (previousJob.getStatus().getError() == null) {
                                     logger.warn(
                                         "Job '{}' already completed successfully despite a transient error, skipping duplicate retry",
@@ -315,6 +311,9 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
     @Builder.Default
     Duration jobPollMaxInterval = Duration.ofSeconds(5);
 
+    /** Consecutive jobs.get misses tolerated before concluding the job is genuinely gone. */
+    private static final int MAX_CONSECUTIVE_JOB_MISSES = 3;
+
     /** Ceiling on the whole wait, matching the client's own DEFAULT_JOB_WAIT_SETTINGS totalTimeout. */
     private static final Duration JOB_WAIT_TIMEOUT = Duration.ofHours(12);
 
@@ -336,6 +335,7 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
     private Job pollUntilDone(BigQuery connection, Job job, Logger logger) throws InterruptedException, BigQueryException {
         var deadline = System.nanoTime() + JOB_WAIT_TIMEOUT.toNanos();
         var interval = this.jobPollInitialInterval;
+        var consecutiveMisses = 0;
 
         while (job != null && !isDone(job)) {
             if (System.nanoTime() - deadline >= 0) {
@@ -349,11 +349,17 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
                 interval = this.jobPollMaxInterval;
             }
 
-            // A null read is TRANSIENT, not "the job is gone": jobs.get can briefly fail to see a
-            // job that was just submitted, and returning null reaches handleErrors(null), whose
-            // IllegalArgumentException is not retryable.
+            // A single null read is TRANSIENT -- jobs.get can briefly fail to see a job that was
+            // just submitted -- so absorb a few. Persistent absence is a real answer though: the
+            // job is gone, and reporting that (null, as Job#waitFor() does) lets the caller
+            // resubmit instead of waiting out the whole deadline.
             var refreshed = connection.getJob(job.getJobId());
-            if (refreshed != null) {
+            if (refreshed == null) {
+                if (++consecutiveMisses >= MAX_CONSECUTIVE_JOB_MISSES) {
+                    return null;
+                }
+            } else {
+                consecutiveMisses = 0;
                 job = refreshed;
             }
         }
