@@ -446,6 +446,42 @@ class BigQueryTransientErrorTest {
         assertThat(submissions.get(), greaterThan(1));
     }
 
+    /**
+     * A job we just submitted is only invisible because jobs.get has not caught up, so the main wait
+     * must tolerate a run of misses. Capping it there would surface a null, and handleErrors(null)
+     * raises an IllegalArgumentException that shouldRetry does not retry -- failing the task hard on
+     * a purely transient condition, under exactly the concurrent load this class is about.
+     */
+    @Test
+    void shouldKeepPollingTheMainWaitThroughSeveralConsecutiveMisses() throws Exception {
+        var task = task();
+        var runContext = TestsUtils.mockRunContext(runContextFactory, task, ImmutableMap.of());
+
+        var jobId = JobId.of("project", "job_slow_to_appear");
+        var reads = new AtomicInteger();
+
+        var submittedStatus = runningStatus();
+
+        var submitted = Mockito.mock(Job.class);
+        Mockito.when(submitted.getJobId()).thenReturn(jobId);
+        Mockito.when(submitted.getStatus()).thenReturn(submittedStatus);
+
+        var finished = terminalJob("job_slow_to_appear", new BigQueryError("invalidQuery", null, "Syntax error"));
+
+        var connection = Mockito.mock(BigQuery.class);
+        // Five misses -- comfortably past MAX_CONSECUTIVE_JOB_MISSES -- then the job appears.
+        Mockito.when(connection.getJob(jobId)).thenAnswer(invocation ->
+            reads.incrementAndGet() <= 5 ? null : finished
+        );
+
+        var failure = failureOf(task, runContext, () -> submitted, connection);
+
+        // It waited the job out rather than declaring it gone: the real error surfaced.
+        assertThat(failure.getErrors().getFirst().getReason(), is("invalidQuery"));
+        assertThat(failure.getCause(), not(instanceOf(IllegalArgumentException.class)));
+        assertThat(reads.get(), greaterThan(5));
+    }
+
     private BigQueryException failureOf(Query task, io.kestra.core.runners.RunContext runContext, java.util.concurrent.Callable<Job> createJob) {
         return failureOf(task, runContext, createJob, Mockito.mock(BigQuery.class));
     }
