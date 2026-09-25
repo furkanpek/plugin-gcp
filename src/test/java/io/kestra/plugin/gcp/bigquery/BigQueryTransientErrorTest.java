@@ -533,9 +533,6 @@ class BigQueryTransientErrorTest {
         var job = Mockito.mock(Job.class);
         Mockito.when(job.getJobId()).thenReturn(JobId.of("project", id));
         Mockito.when(job.getStatus()).thenReturn(status);
-        // The lookback path still calls Job#isDone() directly, so a terminal job must report
-        // terminal to every caller, not only to the status-based poll.
-        Mockito.when(job.isDone()).thenReturn(true);
 
         return job;
     }

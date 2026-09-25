@@ -223,24 +223,18 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
                                 previousJob = pollUntilDone(connection, previousJob, logger, MAX_CONSECUTIVE_JOB_MISSES);
                             }
 
-                            // Nothing to deduplicate against once the previous job is gone: drop the id
-                            // so a later retry does not wait on it again before resubmitting.
-                            if (previousJob == null) {
-                                lastJobId.set(null);
+                            if (previousJob != null && previousJob.getStatus().getError() == null) {
+                                logger.warn(
+                                    "Job '{}' already completed successfully despite a transient error, skipping duplicate retry",
+                                    previousJob.getJobId()
+                                );
+
+                                return previousJob;
                             }
 
-                            if (previousJob != null) {
-                                if (previousJob.getStatus().getError() == null) {
-                                    logger.warn(
-                                        "Job '{}' already completed successfully despite a transient error, skipping duplicate retry",
-                                        previousJob.getJobId()
-                                    );
-
-                                    return previousJob;
-                                }
-
-                                lastJobId.set(null);
-                            }
+                            // Gone or failed, so there is nothing left to deduplicate against: drop the
+                            // id so a later retry resubmits instead of waiting on it again.
+                            lastJobId.set(null);
                         }
                     }
 
@@ -318,7 +312,13 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
     /** Ceiling on the whole wait, matching the client's own DEFAULT_JOB_WAIT_SETTINGS totalTimeout. */
     private static final Duration JOB_WAIT_TIMEOUT = Duration.ofHours(12);
 
-    /** Consecutive jobs.get misses tolerated before concluding a job we did not just submit is gone. */
+    /**
+     * Consecutive jobs.get misses tolerated before concluding a job we did not just submit is gone.
+     * Three rather than one because a lone miss is transient. Three in a row on a job that does still
+     * exist would clear lastJobId and resubmit, which is the duplicate execution #688 guards against;
+     * that is the accepted risk, bounded by this job having answered a jobs.get already, and the
+     * alternative -- never giving up -- holds the lookback on a vanished job for the full deadline.
+     */
     private static final int MAX_CONSECUTIVE_JOB_MISSES = 3;
 
     /**
@@ -333,8 +333,6 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
      * The loop reads the state off the job it just fetched rather than calling Job#isDone(), which
      * issues its own jobs.get and discards the result, doubling the request rate and leaving this
      * handle stale.
-     *
-     * Returns null when the job no longer exists, matching Job#waitFor()'s contract.
      */
     private Job pollUntilDone(BigQuery connection, Job job, Logger logger) throws InterruptedException, BigQueryException {
         return pollUntilDone(connection, job, logger, Integer.MAX_VALUE);
@@ -345,7 +343,8 @@ abstract public class AbstractBigquery extends AbstractTask implements WorkerJob
      * invisible because jobs.get has not caught up, so the main wait tolerates misses until the
      * deadline -- capping it would surface a null, and handleErrors(null) raises an
      * IllegalArgumentException that shouldRetry does not retry, failing the task hard. The lookback
-     * asks about a job from a previous attempt, which really can be gone, so it caps.
+     * asks about a job from a previous attempt, which really can be gone, so it caps and gets back
+     * null -- matching Job#waitFor()'s contract -- which tells it to resubmit.
      */
     private Job pollUntilDone(BigQuery connection, Job job, Logger logger, int maxConsecutiveMisses) throws InterruptedException, BigQueryException {
         var deadline = System.nanoTime() + JOB_WAIT_TIMEOUT.toNanos();
